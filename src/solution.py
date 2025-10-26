@@ -8,98 +8,106 @@ except Exception:  # pragma: no cover - numba optional
     prange = range  # type: ignore[assignment]
 
 
-def _rolling_rank_segment_py(
+def _load_columns(input_path: str) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    df = pd.read_parquet(input_path, columns=["symbol", "Close"])
+    closes = df["Close"].to_numpy(dtype=np.float32, copy=False)
+    indices = df.groupby("symbol", sort=False).indices
+    return closes, indices
+
+
+def _prepare_groups(
+    indices_by_symbol: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    group_arrays = []
+    total = 0
+    for arr in indices_by_symbol.values():
+        idx = np.asarray(arr, dtype=np.int64)
+        if idx.size == 0:
+            continue
+        group_arrays.append(idx)
+        total += idx.size
+
+    group_count = len(group_arrays)
+    offsets = np.empty(group_count, dtype=np.int64)
+    lengths = np.empty(group_count, dtype=np.int64)
+    scatter = np.empty(total, dtype=np.int64)
+
+    cursor = 0
+    for i, idx in enumerate(group_arrays):
+        length = idx.size
+        offsets[i] = cursor
+        lengths[i] = length
+        scatter[cursor : cursor + length] = idx
+        cursor += length
+
+    return scatter, offsets, lengths
+
+
+def _rolling_rank_symbol_impl(
     values: np.ndarray,
     start: int,
     length: int,
     window: int,
-    out: np.ndarray,
+    result: np.ndarray,
 ) -> None:
-    # Sliding comparisons for indices [start, start + length)
-    max_index = start + length
-    for idx in range(start, max_index):
-        tail_start = idx - window + 1
-        if tail_start < start:
-            tail_start = start
-        segment_size = idx - tail_start + 1
-
+    for local_idx in range(length):
+        idx = start + local_idx
         current = values[idx]
+        current_is_nan = np.isnan(current)
+
+        tail = idx - window + 1
+        if tail < start:
+            tail = start
+
+        segment_size = idx - tail + 1
         valid = 0
         count = 0
 
         for offset in range(segment_size):
-            val = values[tail_start + offset]
+            val = values[tail + offset]
             if not np.isnan(val):
                 valid += 1
-                if not np.isnan(current) and val <= current:
+                if not current_is_nan and val <= current:
                     count += 1
 
         if valid == 0:
-            out[idx] = np.nan
+            result[idx] = np.nan
+        elif current_is_nan:
+            result[idx] = np.float32(0.0)
         else:
-            out[idx] = np.float32(count / segment_size)
+            result[idx] = np.float32(count / segment_size)
 
 
-def _compute_all_py(
+def _compute_all_impl(
     values: np.ndarray,
     offsets: np.ndarray,
     lengths: np.ndarray,
     window: int,
     out: np.ndarray,
 ) -> None:
-    for i in range(offsets.size):
-        _rolling_rank_segment_py(values, int(offsets[i]), int(lengths[i]), window, out)
+    for group_idx in range(offsets.size):
+        start = int(offsets[group_idx])
+        length = int(lengths[group_idx])
+        _rolling_rank_symbol_impl(values, start, length, window, out)
 
 
 if njit is not None:
-
-    @njit(cache=False)
-    def _rolling_rank_segment_numba(
-        values: np.ndarray,
-        start: int,
-        length: int,
-        window: int,
-        out: np.ndarray,
-    ) -> None:
-        max_index = start + length
-        for idx in range(start, max_index):
-            tail_start = idx - window + 1
-            if tail_start < start:
-                tail_start = start
-            segment_size = idx - tail_start + 1
-
-            current = values[idx]
-            valid = 0
-            count = 0
-
-            for offset in range(segment_size):
-                val = values[tail_start + offset]
-                if not np.isnan(val):
-                    valid += 1
-                    if not np.isnan(current) and val <= current:
-                        count += 1
-
-            if valid == 0:
-                out[idx] = np.nan
-            else:
-                out[idx] = np.float32(count / segment_size)
+    _rolling_rank_symbol_impl = njit(cache=False)(_rolling_rank_symbol_impl)
 
     @njit(parallel=True, cache=False)
-    def _compute_all_numba(
+    def _compute_all_impl_numba(
         values: np.ndarray,
         offsets: np.ndarray,
         lengths: np.ndarray,
         window: int,
         out: np.ndarray,
     ) -> None:
-        for i in prange(offsets.size):
-            start = int(offsets[i])
-            length = int(lengths[i])
-            _rolling_rank_segment_numba(values, start, length, window, out)
+        for group_idx in prange(offsets.size):
+            start = int(offsets[group_idx])
+            length = int(lengths[group_idx])
+            _rolling_rank_symbol_impl(values, start, length, window, out)
 
-    _compute_all = _compute_all_numba
-else:  # pragma: no cover - fallback when numba missing
-    _compute_all = _compute_all_py
+    _compute_all_impl = _compute_all_impl_numba  # type: ignore[assignment]
 
 
 def ops_rolling_rank(input_path: str, window: int = 20) -> np.ndarray:
@@ -107,53 +115,18 @@ def ops_rolling_rank(input_path: str, window: int = 20) -> np.ndarray:
     if window <= 0:
         raise ValueError("window must be a positive integer")
 
-    df = pd.read_parquet(input_path, columns=["symbol", "Close"])
-    closes = df["Close"].to_numpy(dtype=np.float32, copy=False)
+    closes, indices = _load_columns(input_path)
+    scatter, offsets, lengths = _prepare_groups(indices)
 
-    indices_by_symbol = df.groupby("symbol", sort=False).indices
-    group_arrays = []
-    offsets_list = []
-    lengths_list = []
-    contiguous = True
-
-    for idx_array in indices_by_symbol.values():
-        arr = np.asarray(idx_array, dtype=np.int64)
-        if arr.size == 0:
-            continue
-        group_arrays.append(arr)
-        offsets_list.append(arr[0])
-        lengths_list.append(arr.size)
-        if contiguous and arr[-1] - arr[0] + 1 != arr.size:
-            contiguous = False
-
-    group_count = len(group_arrays)
-    if group_count == 0:
+    if scatter.size == 0:
         return np.empty((0, 1), dtype=np.float32)
 
-    if contiguous:
-        offsets = np.asarray(offsets_list, dtype=np.int64)
-        lengths = np.asarray(lengths_list, dtype=np.int64)
-        result = np.empty_like(closes, dtype=np.float32)
-        _compute_all(closes, offsets, lengths, window, result)
-    else:
-        offsets = np.empty(group_count, dtype=np.int64)
-        lengths = np.empty(group_count, dtype=np.int64)
-        reordered = np.empty_like(closes, dtype=np.float32)
-        scatter_index = np.empty(closes.size, dtype=np.int64)
+    sorted_closes = closes[scatter]
 
-        cursor = 0
-        for group_id, arr in enumerate(group_arrays):
-            length = arr.size
-            offsets[group_id] = cursor
-            lengths[group_id] = length
-            reordered[cursor : cursor + length] = closes[arr]
-            scatter_index[cursor : cursor + length] = arr
-            cursor += length
+    sorted_result = np.empty_like(sorted_closes, dtype=np.float32)
+    _compute_all_impl(sorted_closes, offsets, lengths, window, sorted_result)
 
-        temp_out = np.empty_like(closes, dtype=np.float32)
-        _compute_all(reordered, offsets, lengths, window, temp_out)
-
-        result = np.empty_like(closes, dtype=np.float32)
-        result[scatter_index] = temp_out
+    result = np.empty_like(sorted_closes, dtype=np.float32)
+    result[scatter] = sorted_result
 
     return result.reshape(-1, 1)
